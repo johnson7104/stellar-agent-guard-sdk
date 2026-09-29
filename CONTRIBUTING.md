@@ -129,6 +129,13 @@ npm run build && npm run test:exports   # packs the tarball and resolves every e
 npm run test:integration   # live testnet; needs .env.phase2 (template: .env.phase2.example)
 ```
 
+## Cross-editor standardization
+
+Contributors use diverse operating systems and editors. To prevent cross-platform formatting churn:
+
+- `.editorconfig` establishes baseline editor formatting: 2-space indentation, UTF-8 character encoding, LF line endings, and trimmed trailing whitespace. Note the hierarchy: the project formatter/linter is authoritative; `.editorconfig` assists editors only.
+- `.gitattributes` normalizes text line endings to LF on checkout and commit (`* text=auto eol=lf`), preventing Windows CRLF churn.
+
 ## Test tiers and fixtures
 
 - **Unit** (`npm test`) — no network, no secrets, deterministic.

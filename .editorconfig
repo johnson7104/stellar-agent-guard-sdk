@@ -1,0 +1,19 @@
+# EditorConfig configuration (issue #152)
+#
+# Hierarchy: formatter is authoritative; this file assists editors only.
+#
+# Sets baseline editor-layer defaults (indentation, line endings, trailing whitespace)
+# to prevent cross-editor churn (LF vs CRLF, tabs vs spaces) across OS environments.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+trim_trailing_whitespace = false

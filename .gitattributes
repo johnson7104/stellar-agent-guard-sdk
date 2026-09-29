@@ -1,0 +1,8 @@
+# Auto detect text files and perform LF normalization on checkout and commit
+* text=auto eol=lf
+
+# Explicit binary files
+*.jpeg binary
+*.jpg binary
+*.png binary
+*.wasm binary
