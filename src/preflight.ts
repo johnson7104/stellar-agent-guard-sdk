@@ -1,3 +1,4 @@
+
 /**
  * The pre-flight interceptor: ask the guard whether an action is permitted
  * *before* anything is signed for broadcast.
@@ -26,6 +27,7 @@
  */
 import { createHash } from "node:crypto";
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
+import { resolveServer, type ServerConfig } from "./server.ts";
 import { GuardError, SimulationError } from "./errors.ts";
 import { enforceCall, RpcTimeoutError, timeoutOutcome, withRpcAbort } from "./invoke.ts";
 import { resourceBreakdownFromSimulation, type ResourceBreakdown } from "./cost.ts";
@@ -312,10 +314,6 @@ export interface PreFlightCacheOptions {
 }
 
 export interface PreFlightConfig {
-  /** Pre-built RPC server instance. Mutually exclusive with `url`. */
-  server?: rpc.Server;
-  /** RPC endpoint URL used to construct a server. Mutually exclusive with `server`. */
-  url?: string;
   networkPassphrase: string;
   /** The guarded smart account whose policy is being enforced. */
   guard: ContractAddress;
@@ -325,6 +323,19 @@ export interface PreFlightConfig {
    * single-key default.
    */
   agent: AgentSigner | Keypair;
+  /**
+   * A pre-built `rpc.Server` instance. When supplied, it is used verbatim for
+   * every RPC call — proxy headers, mTLS, or a mock in tests all live on that
+   * instance. Mutually exclusive with `url`; supplying both (or neither) is a
+   * typed error.
+   */
+  server?: rpc.Server;
+  /**
+   * An RPC endpoint URL. The interceptor constructs an `rpc.Server` from it.
+   * Mutually exclusive with `server`; supplying both (or neither) is a typed
+   * error.
+   */
+  url?: string;
   /** Classic account that pays fees and supplies the sequence number. */
   source: Keypair;
   /** Authorizers for non-guard requirements (e.g. an admin on a policy call). */
@@ -352,6 +363,7 @@ export interface PreFlightConfig {
   clock?: Clock;
 }
 
+export type PreFlightServerConfig = ServerConfig;
 /** Alias used by the README's constructor terminology. */
 export type PreFlightInterceptorOptions = PreFlightConfig;
 
@@ -816,26 +828,6 @@ export class PreFlightInterceptor {
     }
     throw new PreFlightUndeterminedError("batch refused by guardrails");
   }
-}
-
-/**
- * Resolve the RPC server for a config, enforcing the `server`/`url` mutual
- * exclusion. A pre-built `server` instance is used verbatim; a `url` builds a
- * fresh `rpc.Server`. Supplying both or neither is a typed error.
- */
-function resolveServer(config: PreFlightConfig): rpc.Server {
-  const hasServer = config.server !== undefined;
-  const hasUrl = config.url !== undefined;
-  if (hasServer && hasUrl) {
-    throw new TypeError(
-      "preflight config: 'server' and 'url' are mutually exclusive — supply exactly one",
-    );
-  }
-  if (!hasServer && !hasUrl) {
-    throw new TypeError("preflight config: one of 'server' or 'url' is required");
-  }
-  if (hasServer) return config.server as rpc.Server;
-  return new rpc.Server(config.url as string);
 }
 
 /** One-shot form, for callers that do not want to hold an interceptor. */

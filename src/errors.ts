@@ -3,8 +3,8 @@
  *
  * Callers should branch on an error class (or on the class attached to a result-
  * oriented `invoke` error outcome), not by matching human-readable messages that
- * may change as the Stellar SDK evolves. Every SDK-owned error extends `GuardError`,
- * so a single `instanceof GuardError` check remains sufficient for
+ * may change as the Stellar SDK evolves. Every SDK-owned error extends 
+ * `GuardError`, so a single `instanceof GuardError` check remains sufficient for
  * integrations that do not need a finer category.
  */
 
@@ -161,22 +161,23 @@ export class AdapterConfigError extends GuardError {
 }
 
 /**
- * A transport configuration was ambiguous or incomplete.
+ * A shared configuration object supplied both a pre-built RPC `Server`
+ * and a `url`, or neither.
  *
- * The telemetry, preflight, and invoke surfaces all accept a shared
- * `{ server?| url? }` config. Exactly one of the two must be provided;
- * providing both (or neither) is a programmer error that fails fast at
- * construction time.
+ * The two sources of transport are mutually exclusive: an injected
+ * instance is used verbatim, so silently ignoring one of them would make a
+ * proxy/mTLS setup appear to apply when it did not. This is a construction-time
+ * programmer error, like `AdapterConfigError`.
  */
 export class TransportConfigError extends GuardError {
-  /** Option key that was ambiguous or missing. */
-  readonly field: "server" | "url";
+  /** Option key that was missing or conflicting. */
+  readonly field: string;
   /** Human-readable description of the expected shape. */
   readonly expected: string;
 
   constructor(
     message: string,
-    options: { field: TransportConfigError["field"]; expected: string; cause?: unknown },
+    options: { field: string; expected: string; cause?: unknown },
   ) {
     super(message, causeOptions(options.cause));
     this.field = options.field;

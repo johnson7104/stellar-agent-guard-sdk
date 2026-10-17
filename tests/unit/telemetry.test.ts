@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { xdr } from "@stellar/stellar-sdk";
+import { SorobanRpc } from "@stellar/stellar-sdk";
 import {
   DEFAULT_JITTER_FRACTION,
   GuardEventRingBuffer,
@@ -20,13 +21,13 @@ import {
   guardEventsFromDiagnostics,
   isAllowedDecision,
   mergeGuardEventStreams,
-  resolveTelemetryServer,
   telemetryFromDecision,
   type GuardDiagnosticBatch,
   type GuardEvent,
   type GuardTelemetryGap,
   type RecentEventFilter,
 } from "../../src/telemetry.ts";
+import { resolveTelemetryServer } from "../../src/telemetry.ts";
 import { unsafeContractAddress } from "../../src/policy.ts";
 
 const GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
@@ -50,52 +51,6 @@ function diagnosticEvent(topics: string[], data: xdr.ScVal = xdr.ScVal.scvMap([]
     },
   };
 }
-
-describe("resolveTelemetryServer", () => {
-  // SDK 17's `SorobanRpc.Server` constructor accepts `{ allowHttp, headers, ... }`
-  // options but no custom fetch; proxy/auth setup therefore happens before the
-  // instance is constructed and the pre-built Server is injected here verbatim.
-  // See README "Injectable transport" for the documented sdk 17 surface.
-  it("uses an injected Server instance verbatim instead of constructing one from the url", () => {
-    const fakeServer = { getEvents: async () => ({ events: [] }) };
-    const resolved = resolveTelemetryServer({ server: fakeServer as never });
-    assert.equal(resolved, fakeServer);
-  });
-
-  it("rejects a config that supplies both server and url", () => {
-    assert.throws(
-      () =>
-        resolveTelemetryServer({
-          server: {} as never,
-          url: "https://rpc.example.com",
-        }),
-      /both/i,
-    );
-  });
-
-  it("rejects a config that supplies neither server nor url", () => {
-    assert.throws(() => resolveTelemetryServer({}), /server|url/i);
-  });
-
-  it("adopts an injected Server verbatim in a listener, so no URL is needed in tests", async () => {
-    // Proof of DX: a fake Server object is enough to drive the listener — no
-    // RPC URL string, no network. Every call must land on this instance.
-    const calls: string[] = [];
-    const fakeServer = {
-      getLatestLedger: async () => {
-        calls.push("getLatestLedger");
-        return { sequence: 500 };
-      },
-      getEvents: async () => {
-        calls.push("getEvents");
-        return { events: [], cursor: "cursor_1", latestLedger: 500 };
-      },
-    };
-    const listener = new GuardTelemetryListener({ server: fakeServer as never, guard: GUARD });
-    await listener.poll({ startLedger: 500 });
-    assert.deepEqual(calls, ["getEvents"]);
-  });
-});
 
 describe("guardEventsFromDiagnostics", () => {
   it("decodes a real blocked decision from the captured event", () => {
@@ -1470,5 +1425,59 @@ describe("GuardTelemetryListener counters", () => {
     assert.ok(stats);
     assert.equal(stats!.allowed, 2);
     assert.equal(stats!.blocked, 0);
+  });
+});
+
+/**
+ * Injectable transport (issue #97).
+ *
+ * Enterprise/agent deployments route RPC through proxies (auth headers, mTLS)
+ * or mock it entirely in tests. The listener must accept a pre-built
+ * `SorobanRpc.Server` instance verbatim, and the shared `{server?|url?}` config
+ * must reject both-or-neither with a typed error. A fake Server object proves
+ * calls land on the injected instance rather than a fresh one built from a URL.
+ */
+describe("injectable transport (issue #97)", () => {
+  it("uses an injected Server instance verbatim, not a fresh one from url", async () => {
+    let getEventsCalls = 0;
+    const fakeServer = {
+      getLatestLedger: async () => ({ sequence: 500 }),
+      getEvents: async () => {
+        getEventsCalls += 1;
+        return { events: [], cursor: "c", latestLedger: 500 };
+      },
+    };
+    const listener = new GuardTelemetryListener({
+      server: fakeServer as unknown as SorobanRpc.Server,
+      guard: GUARD,
+    });
+    await listener.poll({ startLedger: 500 });
+    assert.equal(getEventsCalls, 1, "the injected instance must receive the call");
+  });
+
+  it("rejects a config with both server and url", () => {
+    const fakeServer = {} as unknown as SorobanRpc.Server;
+    assert.throws(
+      () => resolveTelemetryServer({ server: fakeServer, url: "https://rpc.example" }),
+      (error: unknown) =>
+        error instanceof Error && /both|mutually exclusive/i.test(error.message),
+    );
+  });
+
+  it("rejects a config with neither server nor url", () => {
+    assert.throws(
+      () => resolveTelemetryServer({}),
+      (error: unknown) => error instanceof Error && /required|neither/i.test(error.message),
+    );
+  });
+
+  it("returns the injected server unchanged when only server is given", () => {
+    const fakeServer = {} as unknown as SorobanRpc.Server;
+    assert.equal(resolveTelemetryServer({ server: fakeServer }), fakeServer);
+  });
+
+  it("builds a Server from url when only url is given", () => {
+    const server = resolveTelemetryServer({ url: "https://rpc.example" });
+    assert.ok(server instanceof SorobanRpc.Server);
   });
 });

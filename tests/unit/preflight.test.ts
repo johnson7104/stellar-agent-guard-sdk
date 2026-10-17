@@ -103,28 +103,6 @@ function createMockServer(options?: {
   return mock;
 }
 
-/**
- * A fake `rpc.Server` built entirely in-process — no URL, no network.
- *
- * This is the DX the injectable-transport option buys: tests construct the
- * exact server object they want the interceptor to talk to and pass it in
- * verbatim, instead of standing up URL-shaped mocks and hoping the SDK routes
- * to them. Any call that lands on a *different* server is a bug the test
- * cannot accidentally pass.
- */
-function createFakeServer(overrides: Partial<rpc.Server> = {}): rpc.Server {
-  return {
-    getAccount: async () => ({ sequenceNumber: () => "100" }),
-    getLatestLedger: async () => ({ sequence: 1000 }),
-    simulateTransaction: async () => ({
-      minResourceFee: "100",
-      result: { auth: [] },
-      transactionData: { getReadOnly: () => [], getReadWrite: () => [] },
-    }),
-    ...overrides,
-  } as unknown as rpc.Server;
-}
-
 function createTestInterceptor(server: rpc.Server) {
   return new PreFlightInterceptor({
     server,
@@ -327,75 +305,6 @@ describe("validateContractCall validator unit tests", () => {
   });
 });
 
-describe("injectable transport: server instance is used verbatim", () => {
-  it("routes every RPC call to the injected Server instance, not a fresh one", async () => {
-    const calls: string[] = [];
-    const injected = createFakeServer({
-      getAccount: async () => {
-        calls.push("getAccount");
-        return { sequenceNumber: () => "100" } as unknown as Account;
-      },
-      getLatestLedger: async () => {
-        calls.push("getLatestLedger");
-        return { sequence: 1000 } as unknown as rpc.Api.GetLatestLedgerResponse;
-      },
-      simulateTransaction: async () => {
-        calls.push("simulateTransaction");
-        return {
-          minResourceFee: "100",
-          result: { auth: [] },
-          transactionData: { getReadOnly: () => [], getReadWrite: () => [] },
-        } as unknown as rpc.Api.SimulateTransactionSuccessResponse;
-      },
-    });
-
-    const interceptor = createTestInterceptor(injected);
-    const decision = await interceptor.check(validTransferCall());
-
-    assert.equal(decision.kind, "admissible");
-    assert.ok(calls.includes("simulateTransaction"), "simulation must land on the injected server");
-    assert.ok(calls.length > 0, "no RPC call should be routed anywhere but the injected server");
-  });
-
-  it("rejects a config that supplies both server and url", () => {
-    assert.throws(
-      () =>
-        new PreFlightInterceptor({
-          server: createFakeServer(),
-          url: "https://rpc.example.invalid",
-          networkPassphrase: "Test SDF Network ; September 2015",
-          guard: VALID_GUARD,
-          agent: Keypair.random(),
-          source: Keypair.random(),
-        } as unknown as ConstructorParameters<typeof PreFlightInterceptor>[0]),
-      (err: unknown) => {
-        assert(err instanceof InvalidInputError);
-        assert.equal(err.field, "server");
-        assert.equal(err.rule, "mutually_exclusive");
-        return true;
-      },
-    );
-  });
-
-  it("rejects a config that supplies neither server nor url", () => {
-    assert.throws(
-      () =>
-        new PreFlightInterceptor({
-          networkPassphrase: "Test SDF Network ; September 2015",
-          guard: VALID_GUARD,
-          agent: Keypair.random(),
-          source: Keypair.random(),
-        } as unknown as ConstructorParameters<typeof PreFlightInterceptor>[0]),
-      (err: unknown) => {
-        assert(err instanceof InvalidInputError);
-        assert.equal(err.field, "server");
-        assert.equal(err.rule, "required");
-        return true;
-      },
-    );
-  });
-});
-
 describe("interceptor.check() input validation and zero RPC round-trips", () => {
   it("throws InvalidInputError synchronously with 0 RPC requests on malformed contract ID", async () => {
     const mockServer = createMockServer();
@@ -456,24 +365,58 @@ describe("interceptor.check() input validation and zero RPC round-trips", () => 
 
     assert.equal(mockServer.requestCount, 0, "No RPC calls should be attempted on invalid amount");
   });
+});
 
-  it("uses a fake Server object instead of a URL mock (DX adoption)", async () => {
-    // Same guarantee as the URL-mock tests above, expressed with a plain object:
-    // invalid input must never reach the injected server.
-    let touched = false;
-    const injected = createFakeServer({
-      simulateTransaction: async () => {
-        touched = true;
-        throw new Error("should not be called");
+describe("injectable transport: pre-built rpc.Server instance used verbatim", () => {
+  it("routes every RPC call to the injected Server instance, not a fresh one from a URL", async () => {
+    // A fake Server object built by hand — no URL string, no network. This is
+    // the DX the injectable transport unlocks: deterministic unit tests without
+    // scattering RPC URLs across the suite.
+    const calls: string[] = [];
+    const fakeServer = {
+      async getAccount() {
+        calls.push("getAccount");
+        return { sequenceNumber: () => "100" };
       },
-    });
-    const interceptor = createTestInterceptor(injected);
+      async getLatestLedger() {
+        calls.push("getLatestLedger");
+        return { sequence: 1000 };
+      },
+      async simulateTransaction() {
+        calls.push("simulateTransaction");
+        return {
+          minResourceFee: "100",
+          result: { auth: [] },
+          transactionData: {
+            getReadOnly: () => [],
+            getReadWrite: () => [],
+          },
+        };
+      },
+    } as unknown as rpc.Server;
 
-    await assert.rejects(
-      async () => interceptor.check({ contract: unsafeContractAddress(""), fn: "transfer", args: [] }),
-      InvalidInputError,
+    const interceptor = createTestInterceptor(fakeServer);
+    const decision = await interceptor.check(validTransferCall());
+
+    assert.equal(decision.kind, "admissible");
+    // The injected instance received the calls; nothing else could have.
+    assert.ok(calls.includes("getAccount"), "getAccount must land on the injected server");
+    assert.ok(
+      calls.includes("simulateTransaction"),
+      "simulateTransaction must land on the injected server",
     );
-    assert.equal(touched, false, "invalid input must not reach the injected server");
+  });
+
+  it("uses the injected instance even when its methods are spies with call counts", async () => {
+    const mockServer = createMockServer();
+    const interceptor = createTestInterceptor(mockServer);
+
+    await interceptor.check(validTransferCall());
+
+    assert.ok(
+      mockServer.requestCount > 0,
+      "the injected mock server must observe the RPC round-trips",
+    );
   });
 });
 
