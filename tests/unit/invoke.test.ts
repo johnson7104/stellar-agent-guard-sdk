@@ -22,13 +22,13 @@ import {
   DEFAULT_INVOKE_RETRY_OPTIONS,
   invoke,
   InvokeRetryError,
+  resolveInvokeServer,
 } from "../../src/invoke.ts";
 import { BroadcastError } from "../../src/tx.ts";
 import { SimulationError } from "../../src/errors.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
 import { TRACE_STEP_NAMES, type TraceStepName } from "../../src/trace.ts";
 import type { InvokeStepEvent } from "../../src/invoke.ts";
-import { resolveServer, ServerConfigError } from "../../src/server-config.ts";
 import { unsafeContractAddress, unsafeAccountAddress } from "../../src/policy.ts";
 
 const GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
@@ -131,9 +131,6 @@ function createMockServer(options: MockServerOptions = {}) {
   let sends = 0;
   let accountLookups = 0;
   const mock = {
-    // A real rpc.Server exposes its URL; the shared config resolver reads it
-    // when a pre-built instance is injected, so the fake carries one too.
-    serverURL: "https://mock.invalid/soroban/rpc",
     get simulationCount() {
       return simulations;
     },
@@ -188,6 +185,40 @@ function makeParams(
     ...overrides,
   };
 }
+
+/**
+ * Adoption of the injectable-transport config: a fake Server object built
+ * directly (no URL string, no network) is passed through the shared
+ * `{ server? | url? }` shape and must be used verbatim — the pipeline must
+ * land its calls on this exact instance, not a fresh one constructed from a
+ * url.
+ */
+describe("invoke() injectable server", () => {
+  it("uses an injected Server instance verbatim (calls land on it, not a fresh one)", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const server = createMockServer();
+
+    const pending = invoke(makeParams(server));
+    await drainWithMockedTimers(t.mock.timers, pending);
+    const outcome = await pending;
+
+    assert.equal(outcome.kind, "allowed");
+    // The mock's own counters prove the injected instance was the one used.
+    assert.equal(server.simulationCount, 2);
+    assert.equal(server.sendCount, 1);
+    assert.equal(server.accountLookupCount, 1);
+  });
+
+  it("resolves a pre-built server over a url when both are supplied", () => {
+    const server = createMockServer();
+    const resolved = resolveInvokeServer({ server, url: "https://example.invalid" });
+    assert.equal(resolved, server);
+  });
+
+  it("rejects a config with neither server nor url", () => {
+    assert.throws(() => resolveInvokeServer({}), /server.*url|url.*server/i);
+  });
+});
 
 /**
  * A post-inclusion stale-ledger resource rejection, from the recorded real
@@ -1282,89 +1313,5 @@ describe("invoke() fee-bump retry lifecycle", () => {
 
     assert.equal(outcome.kind, "allowed");
     assert.equal(sendCalls.length, 2);
-  });
-});
-
-/**
- * Injectable transport (issue: `server?: SorobanRpc.Server` wins over `url`).
- *
- * The shared `{ server? | url? }` config is resolved by `resolveServer` before
- * the pipeline runs. These tests pin the contract that matters for DX: an
- * injected instance is used verbatim (calls land on it, not a fresh one built
- * from a URL), and the mutual-exclusion / missing-config cases are typed
- * errors rather than silent fallbacks.
- */
-describe("invoke() injectable transport: { server? | url? }", () => {
-  it("uses an injected Server instance verbatim: every RPC call lands on it", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const server = createMockServer();
-
-    const pending = invoke(makeParams(server));
-    await drainWithMockedTimers(t.mock.timers, pending);
-    const outcome = await pending;
-
-    assert.equal(outcome.kind, "allowed");
-    // The fake drove the whole pipeline: its counters prove the injected
-    // instance was the one called, not a fresh Server built from a URL.
-    assert.equal(server.simulationCount, 2);
-    assert.equal(server.sendCount, 1);
-    assert.equal(server.accountLookupCount, 1);
-  });
-
-  it("resolves an injected instance without touching the network", () => {
-    const server = createMockServer();
-    const resolved = resolveServer({ server });
-    assert.equal(resolved, server);
-  });
-
-  it("rejects config with both server and url as a typed error", () => {
-    const server = createMockServer();
-    assert.throws(
-      () => resolveServer({ server, url: "https://example.invalid/soroban/rpc" }),
-      (error: unknown) => {
-        assert.ok(error instanceof ServerConfigError);
-        assert.equal(error.code, "both_server_and_url");
-        return true;
-      },
-    );
-  });
-
-  it("rejects config with neither server nor url as a typed error", () => {
-    assert.throws(
-      () => resolveServer({}),
-      (error: unknown) => {
-        assert.ok(error instanceof ServerConfigError);
-        assert.equal(error.code, "missing_server_or_url");
-        return true;
-      },
-    );
-  });
-
-  it("surfaces the typed config error as an invoke() error outcome", async () => {
-    const outcome = await invoke({
-      // @ts-expect-error — deliberately invalid: both levers supplied.
-      server: createMockServer(),
-      url: "https://example.invalid/soroban/rpc",
-      source: Keypair.random(),
-      call: transferCall(),
-      networkPassphrase: PASSPHRASE,
-    });
-
-    assert.equal(outcome.kind, "error");
-    assert.ok(outcome.error instanceof ServerConfigError);
-    assert.equal(outcome.error.code, "both_server_and_url");
-  });
-
-  it("surfaces a missing-config error as an invoke() error outcome", async () => {
-    const outcome = await invoke({
-      // @ts-expect-error — deliberately invalid: no server and no url.
-      source: Keypair.random(),
-      call: transferCall(),
-      networkPassphrase: PASSPHRASE,
-    });
-
-    assert.equal(outcome.kind, "error");
-    assert.ok(outcome.error instanceof ServerConfigError);
-    assert.equal(outcome.error.code, "missing_server_or_url");
   });
 });

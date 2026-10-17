@@ -135,7 +135,7 @@ export class PolicyDecodeError extends GuardError {
  * An adapter was constructed with misconfigured options.
  *
  * This is a programmer error, not a policy refusal: it is thrown at
- * construction time, before the adapter ever sees an agent action, so a code
+ * construction time, before the adapter ever sees an agent action, so a code 
  * bug in the integration fails fast instead of killing the first tool call of
  * production. The `field` names the offending option and `expected` describes
  * the shape it must have, so the fix is obvious without reading this SDK's
@@ -161,24 +161,21 @@ export class AdapterConfigError extends GuardError {
 }
 
 /**
- * A shared configuration object supplied both a pre-built RPC `Server`
- * and a `url`, or neither.
+ * RPC transport configuration was missing or ambiguous.
  *
- * The two sources of transport are mutually exclusive: an injected
- * instance is used verbatim, so silently ignoring one of them would make a
- * proxy/mTLS setup appear to apply when it did not. This is a construction-time
- * programmer error, like `AdapterConfigError`.
+ * The three public surfaces (`preflight`, `telemetry`, `invoke`) accept a
+ * shared `{server?|url?}` config. Exactly one of the two must be supplied:
+ * passing both is ambiguous (which wins?) and passing neither leaves the SDI
+ * with no way to reach the network. Both cases fail fast at construction
+ * time with this error rather than at the first RPC call.
  */
-export class TransportConfigError extends GuardError {
-  /** Option key that was missing or conflicting. */
+export class RoutingConfigError extends GuardError {
+  /** Option key that was missing or conflicting, e.g. `"server"`. */
   readonly field: string;
   /** Human-readable description of the expected shape. */
   readonly expected: string;
 
-  constructor(
-    message: string,
-    options: { field: string; expected: string; cause?: unknown },
-  ) {
+  constructor(message: string, options: { field: string; expected: string; cause?: unknown }) {
     super(message, causeOptions(options.cause));
     this.field = options.field;
     this.expected = options.expected;

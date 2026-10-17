@@ -27,7 +27,7 @@
  */
 import { createHash } from "node:crypto";
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
-import { resolveServer, type ServerConfig } from "./server.ts";
+import { resolveRpcServer, type RpcServerConfig } from "./transport.ts";
 import { GuardError, SimulationError } from "./errors.ts";
 import { enforceCall, RpcTimeoutError, timeoutOutcome, withRpcAbort } from "./invoke.ts";
 import { resourceBreakdownFromSimulation, type ResourceBreakdown } from "./cost.ts";
@@ -313,7 +313,7 @@ export interface PreFlightCacheOptions {
   policyRevision?: PolicyRevision | (() => PolicyRevision | Promise<PolicyRevision>);
 }
 
-export interface PreFlightConfig {
+export interface PreFlightConfig extends RpcServerConfig {
   networkPassphrase: string;
   /** The guarded smart account whose policy is being enforced. */
   guard: ContractAddress;
@@ -323,19 +323,6 @@ export interface PreFlightConfig {
    * single-key default.
    */
   agent: AgentSigner | Keypair;
-  /**
-   * A pre-built `rpc.Server` instance. When supplied, it is used verbatim for
-   * every RPC call — proxy headers, mTLS, or a mock in tests all live on that
-   * instance. Mutually exclusive with `url`; supplying both (or neither) is a
-   * typed error.
-   */
-  server?: rpc.Server;
-  /**
-   * An RPC endpoint URL. The interceptor constructs an `rpc.Server` from it.
-   * Mutually exclusive with `server`; supplying both (or neither) is a typed
-   * error.
-   */
-  url?: string;
   /** Classic account that pays fees and supplies the sequence number. */
   source: Keypair;
   /** Authorizers for non-guard requirements (e.g. an admin on a policy call). */
@@ -363,7 +350,6 @@ export interface PreFlightConfig {
   clock?: Clock;
 }
 
-export type PreFlightServerConfig = ServerConfig;
 /** Alias used by the README's constructor terminology. */
 export type PreFlightInterceptorOptions = PreFlightConfig;
 
@@ -427,7 +413,7 @@ export class PreFlightInterceptor {
 
   constructor(config: PreFlightConfig) {
     this.config = config;
-    this.server = resolveServer(config);
+    this.server = resolveRpcServer(config);
     this.cacheOptions = config.cache;
     this.clock = config.clock ?? systemClock;
     this.validateCacheOptions();

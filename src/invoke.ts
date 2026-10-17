@@ -1,4 +1,4 @@
-import { rpc as _rpc } from "@stellar/stellar-sdk";
+
 /**
  * The full invocation pipeline for a guarded account, in the order the Stellar
  * host actually requires:
@@ -17,7 +17,6 @@ import { rpc as _rpc } from "@stellar/stellar-sdk";
  * which is the property the pre-flight interceptor is built to expose.
  */
 import { Account, Address, Keypair, Operation, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
-import type { Server } from "@stellar/stellar-sdk/lib/rpc/server";
 import { feeBreakdown, type FeeBreakdown } from "./cost.ts";
 import {
   BroadcastError,
@@ -55,58 +54,6 @@ import {
   type SubmissionResult,
 } from "./tx.ts";
 
-/**
- * Shared RPC endpoint configuration consumed by every surface (`invoke`,
- * `check`, `cost`).
- *
- * Exactly one of `server` or `url` must be supplied:
- *
- *  - `server` — a pre-built `rpc.Server` instance, used verbatim. This is the
- *    escape hatch for enterprise/agent deployments that route RPC through a
- *    proxy (auth headers, mTLS, latency shielding) or mock it entirely in
- *    tests: the proxy setup happens *before* constructing the `Server`, and the
- *    SDK never rebuilds one from a URL.
- *  - `url` — a Soroban RPC endpoint the SDK constructs a `Server` from.
- *
- * Supplying both, or neither, is a programming error and is rejected with a
- * typed `GuardError` before any RPC call is made.
- *
- * Note on `stellar-sdk` 17: `rpc.Server`'s constructor accepts
- * `{ allowHttp?, headers?, fetch? }` in addition to the URL, so a custom
- * `fetch` can be injected when constructing the `Server` — but the SDK does
- * not expose a separate `transport` option on `invoke`/`check`/`cost`. To use
- * a custom `fetch`, construct the `Server` yourself and pass it as `server`.
- */
-export type RpcEndpointConfig =
-  | { server: rpc.Server; url?: undefined }
-  | { url: string; server?: undefined };
-
-/**
- * Resolve an {@link RpcEndpointConfig} to the `rpc.Server` the pipeline uses.
- *
- * The injected instance is returned verbatim — never wrapped, never rebuilt
- * from a URL — so a caller's proxy configuration, custom `fetch`, or test
- * double is exactly what every RPC call lands on.
- */
-export function resolveServer(config: RpcEndpointConfig): rpc.Server {
-  const hasServer = config.server !== undefined;
-  const hasUrl = config.url !== undefined;
-  if (hasServer && hasUrl) {
-    throw new GuardError(
-      "RPC endpoint config is ambiguous: supply either `server` or `url`, not both",
-      { cause: "config" },
-    );
-  }
-  if (!hasServer && !hasUrl) {
-    throw new GuardError(
-      "RPC endpoint config is missing: supply either `server` or `url`",
-      { cause: "config" },
-    );
-  }
-  if (hasServer) return config.server as rpc.Server;
-  return new rpc.Server(config.url as string);
-}
-
 /** How the guard's authorization is produced for a call that needs it. */
 export interface GuardAuthorization {
   guard: string;
@@ -133,6 +80,72 @@ export interface GuardAuthorization {
  * bound at all pass `timeoutMs: 0` (documented below).
  */
 export const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+/**
+ * Raised when a caller supplies both `server` and `url`, or neither.
+ *
+ * The two are mutually exclusive by design: an injected `rpc.Server` instance
+ * wins over a URL, so accepting both would silently ignore one of them. The
+ * error is typed so callers can branch on `instanceof` rather than matching
+ * message text, and it is thrown eagerly — before any RPC is attempted — so a
+ * misconfiguration never turns into a confusing transport failure.
+ */
+export class RpcConfigError extends GuardError {
+  readonly kind = "config" as const;
+
+  constructor(message: string) {
+    super(message, { cause: "undetermined" });
+    this.name = "RpcConfigError";
+  }
+}
+
+/**
+ * Shared RPC endpoint configuration consumed by every surface (`invoke`,
+ * `check`, `cost`).
+ *
+ * Exactly one of the two fields must be supplied:
+ *
+ *  - `server` — a pre-built `rpc.Server` instance. Used verbatim, so any proxy
+ *    setup (auth headers, mTLS, latency shielding) happens *before* the
+ *    instance is constructed and is entirely the caller's concern. This is
+ *    also the lever for deterministic tests: a fake `Server` object can be
+ *    passed in and every RPC call lands on it.
+ *  - `url` — a Soroban RPC URL. The SDK constructs a `Server` from it.
+ *
+ * Supplying both, or neither, is a typed `RpcConfigError`. See the README's
+ * "Custom RPC transport" section for what `stellar-sdk` 17 actually supports
+ * (its `Server` constructor takes `{ allowHttp, headers, fetch }`, so header
+ * injection and custom `fetch` are available on the constructed instance).
+ */
+export type RpcEndpointConfig =
+  | { server: rpc.Server; url?: undefined }
+  | { url: string; server?: undefined };
+
+/**
+ * Resolve the `{server?|url?}` config into a concrete `rpc.Server`.
+ *
+ * Validates mutual exclusion eagerly and throws a typed `RpcConfigError` for
+ * both-supplied and neither-supplied. An injected instance is returned
+ * verbatim — never re-wrapped, never replaced by one built from a URL — so a
+ * caller's proxy-configured `Server` (or a test double) is exactly what the
+ * pipeline uses.
+ */
+export function resolveServer(config: RpcEndpointConfig): rpc.Server {
+  const hasServer = config.server !== undefined;
+  const hasUrl = config.url !== undefined;
+  if (hasServer && hasUrl) {
+    throw new RpcConfigError(
+      "RPC config is ambiguous: supply either `server` (a pre-built rpc.Server) or `url`, not both",
+    );
+  }
+  if (!hasServer && !hasUrl) {
+    throw new RpcConfigError(
+      "RPC config is missing: supply either `server` (a pre-built rpc.Server) or `url`",
+    );
+  }
+  if (hasServer) return config.server as rpc.Server;
+  return new rpc.Server(config.url as string);
+}
 
 /**
  * Raised when an RPC call is aborted or exceeds its timeout.
@@ -459,7 +472,6 @@ export interface InvokePollOptions {
 }
 
 export interface InvokeParams {
-  /** Pre-built RPC server instance; mutually exclusive with `url`. */
   server?: rpc.Server | undefined;
   /** Soroban RPC URL; mutually exclusive with `server`. */
   url?: string | undefined;
@@ -959,19 +971,23 @@ export function invoke(
 ): Promise<Exclude<InvokeOutcome, InvokeDryRunResult>>;
 export function invoke(params: InvokeParams): Promise<InvokeOutcome>;
 export async function invoke(params: InvokeParams): Promise<InvokeOutcome> {
+  // Resolve `{server?|url?}` eagerly so a misconfiguration is a typed error
+  // before any RPC is attempted, and so every downstream stage sees a concrete
+  // `Server`. An injected instance is used verbatim.
   const server = resolveServer(params);
+  const resolved: InvokeParams = { ...params, server };
   // A dry run performs exactly one pass: it never reaches broadcast, so there
   // is no stale-ledger rejection to retry, no sleep to justify, and nothing to
   // serialize against the account queue.
-  if (params.dryRun) return invokeDryRun(params);
+  if (resolved.dryRun) return invokeDryRun(resolved);
 
   try {
     // Every RPC the pipeline makes sits inside this bound: an already-aborted
     // signal short-circuits before the account is looked up, and a mid-flight
     // abort or a fired timeout rejects promptly with `RpcTimeoutError`.
     return await withRpcAbort(
-      { stage: "invoke", signal: params.signal, timeoutMs: params.timeoutMs },
-      () => invokeWithQueue({ ...params, server }),
+      { stage: "invoke", signal: resolved.signal, timeoutMs: resolved.timeoutMs },
+      () => invokeWithQueue(resolved),
     );
   } catch (error) {
     if (error instanceof RpcTimeoutError) {
@@ -985,7 +1001,7 @@ export async function invoke(params: InvokeParams): Promise<InvokeOutcome> {
 
 async function invokeWithQueue(params: InvokeParams): Promise<InvokeOutcome> {
   const sourceKey = await params.source.publicKey();
-  return withAccountQueue(resolveServer(params), sourceKey, async () => {
+  return withAccountQueue(params.server as rpc.Server, sourceKey, async () => {
     const retry = resolveRetryOptions(params.retry);
     const logger = resolveLogger(params.logger);
 
@@ -1219,7 +1235,7 @@ async function invokePipeline(
   attempt: number,
   options?: { inclusionFee?: bigint | undefined },
 ): Promise<PipelineOutcome> {
-  const server = resolveServer(params);
+  const server = params.server as rpc.Server;
   const onStep = stepHook(params.onStep, resolveLogger(params.logger));
   const enforced = await enforceCall(
     {
@@ -1361,8 +1377,8 @@ export async function enforceCall(
   params: InvokeParams,
   attempt: number = 0,
 ): Promise<EnforcementOutcome> {
+  const server = params.server as rpc.Server;
   const { source, call, networkPassphrase } = params;
-  const server = resolveServer(params);
   const logger = resolveLogger(params.logger);
   const onStep = stepHook(params.onStep, logger);
 

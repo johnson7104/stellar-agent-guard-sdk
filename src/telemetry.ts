@@ -550,20 +550,24 @@ export class GuardEventRingBuffer {
 }
 
 export interface GuardTelemetryConfig {
-  /** Pre-built RPC server. Mutually exclusive with `url`. */
+  /**
+   * A pre-built `rpc.Server` instance. Mutually exclusive with `url`; when
+   * both are supplied, the constructor throws a typed error. When supplied,
+   * the instance is used verbatim — proxy setup (auth headers, mTLS) happens
+   * *before* constructing it, and this listener never re-wraps it.
+   */
   server?: rpc.Server;
+  /**
+   * RPC URL used to construct a `rpc.Server` when no `server` instance is
+   * supplied. Mutually exclusive with `server`.
+   */
+  url?: string;
   /** The guard contract to follow. */
   guard: string;
   /** Opt in to scanning failed transaction diagnostics as a third stream. */
   failedTx?: boolean;
   /** RPC URL, only used for error messages. */
   rpcUrl?: string;
-  /**
-   * RPC URL to construct a `rpc.Server` from when no pre-built `server` is
-   * supplied. Mutually exclusive with `server`. Proxy/auth/mTLS setup must
-   * happen before constructing the `Server` — pass `server` for that.
-   */
-  url?: string;
   /**
    * Optional log sink for this listener's diagnostics: a summary of every page
    * received (with how many events were dropped as unrecognised), a coverage
@@ -606,35 +610,6 @@ export interface GuardTelemetryConfig {
    * `startLedger` is used).
    */
   cursorStore?: CursorStore;
-}
-
-/**
- * Resolve the shared `{ server? | url? }` transport config into a concrete
- * `rpc.Server`, validating mutual exclusion.
- *
- * Exactly one of `server` / `url` must be supplied: both is ambiguous (which
- * wins?), neither leaves the listener with no transport. Both cases throw a
- * typed error so a misconfiguration fails loudly at construction time rather
- * than as an opaque RPC failure on the first poll.
- */
-export function resolveTelemetryServer(config: {
-  server?: rpc.Server | undefined;
-  url?: string | undefined;
-}): rpc.Server {
-  const hasServer = config.server !== undefined && config.server !== null;
-  const hasUrl = config.url !== undefined && config.url !== null && config.url !== "";
-  if (hasServer && hasUrl) {
-    throw new TypeError(
-      "telemetry: specify either `server` or `url`, not both",
-    );
-  }
-  if (!hasServer && !hasUrl) {
-    throw new TypeError(
-      "telemetry: one of `server` or `url` is required",
-    );
-  }
-  if (hasServer) return config.server as rpc.Server;
-  return new rpc.Server(config.url as string);
 }
 
 export interface PollResult {
@@ -1171,8 +1146,6 @@ export interface GuardTelemetryLocalConfig {
 export class GuardTelemetryListener {
   private readonly config: GuardTelemetryConfig;
   private readonly logger: GuardLogger;
-  /** The resolved RPC server: either the injected instance or one built from `url`. */
-  private readonly server: rpc.Server;
 
   /** The persistence adapter this listener is using (defaults to in-memory). */
   readonly activeCursorStore: CursorStore;
@@ -1218,10 +1191,6 @@ export class GuardTelemetryListener {
     const resolved = config as GuardTelemetryConfig;
     this.config = resolved;
     this.logger = resolveLogger(resolved.logger);
-    this.server = resolveTelemetryServer({
-      server: resolved.server,
-      url: resolved.url,
-    });
     this.buffer = resolved.buffer ? new GuardEventRingBuffer(resolved.buffer.max) : null;
     this.activeCursorStore = resolved.cursorStore ?? new InMemoryCursorStore();
     this.counters = resolved.counters
@@ -1327,7 +1296,7 @@ export class GuardTelemetryListener {
     params: { cursor?: string; startLedger?: number; limit?: number } = {},
   ): Promise<FailedTxPollResult> {
     if (params.cursor === undefined && params.startLedger === undefined) {
-      const latest = await this.server.getLatestLedger();
+      const latest = await this.config.server.getLatestLedger();
       return { events: [], cursor: String(latest.sequence) };
     }
 
@@ -1344,7 +1313,7 @@ export class GuardTelemetryListener {
         };
 
     try {
-      const response = await this.server.getTransactions(request);
+      const response = await this.config.server.getTransactions(request);
       const events: GuardEvent[] = [];
       for (const tx of response.transactions) {
         if (tx.status !== rpc.Api.GetTransactionStatus.FAILED) continue;
@@ -1380,11 +1349,11 @@ export class GuardTelemetryListener {
     if (!params.cursor && params.startLedger === undefined) {
       // Default to the current head: replaying a year of history by accident is
       // a mean surprise, and callers that want history pass `startLedger`.
-      const latest = await this.server.getLatestLedger();
+      const latest = await this.config.server.getLatestLedger();
       (request as { startLedger: number }).startLedger = latest.sequence;
     }
 
-    const response = await this.server.getEvents(request);
+    const response = await this.config.server.getEvents(request);
     const events: GuardEvent[] = [];
     // Kept rather than merely skipped: an event this listener cannot interpret
     // is a coverage fact a host may need to see, and counting it is the only
@@ -1485,7 +1454,7 @@ export class GuardTelemetryListener {
       expectedFrom = params.resumeLedger === undefined ? null : params.resumeLedger + 1;
     } else {
       if (startLedger === undefined) {
-        const latest = await this.server.getLatestLedger();
+        const latest = await this.config.server.getLatestLedger();
         startLedger = Math.max(1, latest.sequence - 1);
       }
       expectedFrom = startLedger;
