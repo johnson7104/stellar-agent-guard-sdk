@@ -1,3 +1,4 @@
+
 /**
  * Unit tests for invoke() pipeline observability (`onStep`, issue #57).
  *
@@ -17,20 +18,18 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Account, Address, Keypair, nativeToScVal, rpc, SorobanDataBuilder, xdr } from "@stellar/stellar-sdk";
-import { Account as _Account, Address as _Address, Keypair as _Keypair, Operation as _Operation, rpc as _rpc, scValToNative as _scValToNative, xdr as _xdr } from "@stellar/stellar-sdk";
 import {
   DEFAULT_INVOKE_RETRY_OPTIONS,
   invoke,
   InvokeRetryError,
-  resolveInvokeServer,
 } from "../../src/invoke.ts";
 import { BroadcastError } from "../../src/tx.ts";
 import { SimulationError } from "../../src/errors.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
 import { TRACE_STEP_NAMES, type TraceStepName } from "../../src/trace.ts";
 import type { InvokeStepEvent } from "../../src/invoke.ts";
+import { resolveServer, ServerConfigError } from "../../src/transport.ts";
 import { unsafeContractAddress, unsafeAccountAddress } from "../../src/policy.ts";
-import { ServerConfigError } from "../../src/errors.ts";
 
 const GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
 const TOKEN = unsafeContractAddress("CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB");
@@ -173,39 +172,6 @@ function createMockServer(options: MockServerOptions = {}) {
   return mock;
 }
 
-/**
- * A fake `rpc.Server`-shaped object built without a URL. This is the DX the
- * injectable-transport option is meant to unlock: unit tests construct the
- * collaborator they need directly, with no RPC URL string anywhere in the
- * test, and assert that the pipeline's calls land on this exact instance.
- */
-function createFakeServer(overrides: Partial<Record<string, unknown>> = {}) {
-  const calls = { simulate: 0, send: 0, getAccount: 0 };
-  const fake = {
-    calls,
-    async getAccount() {
-      calls.getAccount += 1;
-      return new Account(Keypair.random().publicKey(), "100");
-    },
-    async getLatestLedger() {
-      return { sequence: 1000 };
-    },
-    async simulateTransaction() {
-      calls.simulate += 1;
-      return probeSuccess();
-    },
-    async sendTransaction() {
-      calls.send += 1;
-      return { status: "PENDING", hash: "0".repeat(64) };
-    },
-    async getTransaction() {
-      return { status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 };
-    },
-    ...overrides,
-  };
-  return fake as unknown as rpc.Server & { calls: typeof calls };
-}
-
 function makeParams(
   server: rpc.Server,
   overrides: Partial<Parameters<typeof invoke>[0]> = {},
@@ -220,18 +186,13 @@ function makeParams(
   };
 }
 
-function makeUrlParams(
-  url: string,
-  overrides: Partial<Parameters<typeof invoke>[0]> = {},
-): Parameters<typeof invoke>[0] {
-  return {
-    url,
-    source: Keypair.random(),
-    call: transferCall(),
-    networkPassphrase: PASSPHRASE,
-    guardAuth: { guard: GUARD, agent: Keypair.random() },
-    ...overrides,
-  };
+/**
+ * Builds the shared `{server?|url?}` config consumed by every surface. The
+ * injected instance is used verbatim — no fresh Server is constructed from a
+ * URL — which is what lets these tests assert calls land on the mock.
+ */
+function makeServerConfig(server: rpc.Server) {
+  return { server };
 }
 
 /**
@@ -1330,82 +1291,44 @@ describe("invoke() fee-bump retry lifecycle", () => {
   });
 });
 
-// ── Injectable transport: {server?|url?} config ─────────────────────────────
+// ── Injectable transport: shared `{server?|url?}` config (Issue #XX) ─────────
 
-describe("invoke() injectable transport: {server?|url?}", () => {
-  it("uses an injected Server instance verbatim, never constructing one from a URL", async (t) => {
+describe("invoke() injectable transport", () => {
+  it("uses an injected Server instance verbatim: calls land on the mock, not a fresh one", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
-    const fake = createFakeServer();
+    const server = createMockServer();
 
-    const pending = invoke(makeParams(fake));
+    const pending = invoke(makeParams(server));
     await drainWithMockedTimers(t.mock.timers, pending);
     const outcome = await pending;
 
     assert.equal(outcome.kind, "allowed");
-    // Every RPC call landed on the injected instance.
-    assert.equal(fake.calls.simulate, 2);
-    assert.equal(fake.calls.send, 1);
-    assert.equal(fake.calls.getAccount, 1);
+    // The pipeline drove the injected mock: probe + enforced simulation, one
+    // broadcast, one account lookup. A fresh Server built from a URL would
+    // leave every counter at zero.
+    assert.equal(server.simulationCount, 2);
+    assert.equal(server.sendCount, 1);
+    assert.equal(server.accountLookupCount, 1);
   });
 
-  it("accepts a url-only config and constructs a Server from it", async () => {
-    // No network is hit: the pipeline fails fast on the first RPC call, but
-    // the important assertion is that a Server was constructed from the URL
-    // (i.e. no typed config error was raised before reaching the RPC).
-    const outcome = await invoke(
-      makeUrlParams("https://example.invalid/soroban/rpc", {
-        retry: { maxAttempts: 1 },
-        pollOptions: { pollAttempts: 1, pollIntervalMs: 0 },
-      }),
-    );
-    assert.equal(outcome.kind, "error");
-    // Not a config error: the URL was accepted and a Server was built.
-    assert.ok(!(outcome.error instanceof ServerConfigError));
+  it("accepts the shared {server} config and resolves it to the injected instance", () => {
+    const server = createMockServer();
+    const resolved = resolveServer(makeServerConfig(server));
+    assert.equal(resolved, server);
   });
 
-  it("rejects a config with both server and url as a typed error", async () => {
-    const fake = createFakeServer();
-    const params = {
-      ...makeParams(fake),
-      url: "https://example.invalid/soroban/rpc",
-    } as unknown as Parameters<typeof invoke>[0];
-
-    const outcome = await invoke(params);
-
-    assert.equal(outcome.kind, "error");
-    assert.ok(outcome.error instanceof ServerConfigError);
-    assert.match(outcome.error.message, /both/i);
-    // The injected server was never touched.
-    assert.equal(fake.calls.simulate, 0);
-    assert.equal(fake.calls.send, 0);
-  });
-
-  it("rejects a config with neither server nor url as a typed error", async () => {
-    const params = {
-      source: Keypair.random(),
-      call: transferCall(),
-      networkPassphrase: PASSPHRASE,
-      guardAuth: { guard: GUARD, agent: Keypair.random() },
-    } as unknown as Parameters<typeof invoke>[0];
-
-    const outcome = await invoke(params);
-
-    assert.equal(outcome.kind, "error");
-    assert.ok(outcome.error instanceof ServerConfigError);
-    assert.match(outcome.error.message, /one of/i);
-  });
-
-  it("resolveInvokeServer returns the injected instance unchanged", () => {
-    const fake = createFakeServer();
-    assert.equal(resolveInvokeServer({ server: fake }), fake);
-  });
-
-  it("resolveInvokeServer throws a typed error for both and neither", () => {
-    const fake = createFakeServer();
+  it("rejects a config with both server and url as a typed error", () => {
+    const server = createMockServer();
     assert.throws(
-      () => resolveInvokeServer({ server: fake, url: "https://example.invalid" } as never),
-      ServerConfigError,
+      () => resolveServer({ server, url: "https://rpc.example.com" }),
+      (error: unknown) => error instanceof ServerConfigError,
     );
-    assert.throws(() => resolveInvokeServer({} as never), ServerConfigError);
+  });
+
+  it("rejects a config with neither server nor url as a typed error", () => {
+    assert.throws(
+      () => resolveServer({}),
+      (error: unknown) => error instanceof ServerConfigError,
+    );
   });
 });

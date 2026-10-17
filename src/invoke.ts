@@ -1,4 +1,3 @@
-import { Account, Address, Keypair, Operation, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 /**
  * The full invocation pipeline for a guarded account, in the order the Stellar
  * host actually requires:
@@ -16,6 +15,64 @@ import { Account, Address, Keypair, Operation, rpc, scValToNative, xdr } from "@
  * Steps 1–3 never mutate the ledger. A blocked action therefore costs nothing,
  * which is the property the pre-flight interceptor is built to expose.
  */
+import { Account, Address, Keypair, Operation, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
+
+/**
+ * Shared RPC endpoint configuration consumed by every surface (`preflight`,
+ * `telemetry`, `invoke`).
+ *
+ * Exactly one of the two fields must be supplied:
+ *
+ *  - `server` — a pre-built `SorobanRpc.Server` instance. It is used verbatim,
+ *    so any proxy/auth/mTLS setup happens *before* constructing the `Server`
+ *    and is passed in here. This is the only injection lever sdk 17 exposes:
+ *    its `Server` constructor takes `(url, opts?)` where `opts` covers
+ *    `allowHttp`, `timeout`, and `headers` — there is no custom `fetch` hook.
+ *  - `url` — a plain RPC URL; the SDK constructs a `Server` from it.
+ *
+ * Supplying both, or neither, is a typed configuration error.
+ */
+export type RpcEndpointConfig =
+  | { server: rpc.Server; url?: undefined }
+  | { url: string; server?: undefined };
+
+/**
+ * Raised when an `RpcEndpointConfig` is malformed (both fields set, or
+ * neither). A typed error so callers can branch on it rather than parsing a
+ * message.
+ */
+export class RpcEndpointConfigError extends GuardError {
+  readonly kind = "config" as const;
+
+  constructor(message: string) {
+    super(message, { cause: "undetermined" });
+    this.name = "RpcEndpointConfigError";
+  }
+}
+
+/**
+ * Validate an `RpcEndpointConfig` and return the `Server` to use.
+ *
+ * An injected `server` is returned verbatim — never wrapped or reconstructed —
+ * so a caller's proxy-configured instance is exactly what the pipeline talks
+ * to. A `url` produces a fresh `Server`. Both/neither throw
+ * `RpcEndpointConfigError`.
+ */
+export function resolveRpcServer(config: RpcEndpointConfig): rpc.Server {
+  const hasServer = config.server !== undefined;
+  const hasUrl = config.url !== undefined;
+  if (hasServer && hasUrl) {
+    throw new RpcEndpointConfigError(
+      "RpcEndpointConfig must supply exactly one of `server` or `url`, not both",
+    );
+  }
+  if (!hasServer && !hasUrl) {
+    throw new RpcEndpointConfigError(
+      "RpcEndpointConfig must supply one of `server` or `url`",
+    );
+  }
+  return hasServer ? config.server : new rpc.Server(config.url);
+}
 import { feeBreakdown, type FeeBreakdown } from "./cost.ts";
 import {
   BroadcastError,

@@ -3,8 +3,8 @@
  *
  * Callers should branch on an error class (or on the class attached to a result-
  * oriented `invoke` error outcome), not by matching human-readable messages that
- * may change as the Stellar SDK evolves. Every SDK-owned error extends
- * `GuardError`, so a single `instanceof GuardError` check remains sufficient for
+ * may change as the Stellar SDK evolves. Every SDK-owned error extends `GuardError`,
+ * so a single `instanceof GuardError` check remains sufficient for
  * integrations that do not need a finer category.
  */
 
@@ -60,7 +60,7 @@ export interface BroadcastFailurePayload {
 export interface BroadcastFailureParams {
   attempts: number;
   lastFee: bigint;
-  failure: BroadcastFailurePaayload;
+  failure: BroadcastFailurePayload;
   detail?: string | undefined;
 }
 
@@ -137,8 +137,8 @@ export class PolicyDecodeError extends GuardError {
  * This is a programmer error, not a policy refusal: it is thrown at
  * construction time, before the adapter ever sees an agent action, so a code
  * bug in the integration fails fast instead of killing the first tool call of
- * production. The `field` names the offending option and `expected` describes the
- * shape it must have, so the fix is obvious without reading this SDK's
+ * production. The `field` names the offending option and `expected` describes
+ * the shape it must have, so the fix is obvious without reading this SDK's
  * source.
  */
 export class AdapterConfigError extends GuardError {
@@ -161,22 +161,25 @@ export class AdapterConfigError extends GuardError {
 }
 
 /**
- * The RPC transport configuration passed to a surface is invalid.
+ * A transport configuration was ambiguous or incomplete.
  *
- * Thrown at construction time when a caller supplies both `server` and
- * `url` (ambiguous) or neither (unconfigured). The injected `server` is used
- * verbatim when provided, so proxy/auth/mTLS setup can happen before this SDK
- * sees the client.
+ * The telemetry, preflight, and invoke surfaces all accept a shared
+ * `{ server?| url? }` config. Exactly one of the two must be provided;
+ * providing both (or neither) is a programmer error that fails fast at
+ * construction time.
  */
-export class RpcConfigError extends GuardError {
-  /** Which configuration rule was violated. */
-  readonly reason: "both-provided" | "neither-provided";
+export class TransportConfigError extends GuardError {
+  /** Option key that was ambiguous or missing. */
+  readonly field: "server" | "url";
+  /** Human-readable description of the expected shape. */
+  readonly expected: string;
 
   constructor(
     message: string,
-    options: { reason: RpcConfigError["reason"]; cause?: unknown },
+    options: { field: TransportConfigError["field"]; expected: string; cause?: unknown },
   ) {
     super(message, causeOptions(options.cause));
-    this.reason = options.reason;
+    this.field = options.field;
+    this.expected = options.expected;
   }
 }
