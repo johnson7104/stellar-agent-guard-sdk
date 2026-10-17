@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Account, Address, Keypair, nativeToScVal, rpc, xdr } from "@stellar/stellar-sdk";
+import { Address, Keypair, nativeToScVal, rpc, xdr } from "@stellar/stellar-sdk";
 import {
   InvalidInputError,
   PreFlightInterceptor,
@@ -14,13 +14,15 @@ import {
   type PreFlightCacheOptions,
   type PreFlightDecision,
 } from "../../src/preflight.ts";
+import { RpcTimeoutError } from "../../src/invoke.ts";
 import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
 import type { ContractCall } from "../../src/tx.ts";
+import { unsafeContractAddress, unsafeAccountAddress } from "../../src/policy.ts";
 
-const VALID_GUARD = "CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44";
-const VALID_TOKEN = "CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB";
-const RECIPIENT = "GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH";
+const VALID_GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
+const VALID_TOKEN = unsafeContractAddress("CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB");
+const RECIPIENT = unsafeAccountAddress("GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH");
 
 function validTransferCall(amount: bigint = 100n): ContractCall {
   return {
@@ -35,7 +37,12 @@ function validTransferCall(amount: bigint = 100n): ContractCall {
 }
 
 /** Mock RPC server to track calls and assert zero requests when validation fails. */
-function createMockServer(options?: { simulateResponse?: unknown; enforcedSimulateResponse?: unknown }) {
+function createMockServer(options?: {
+  simulateResponse?: unknown;
+  enforcedSimulateResponse?: unknown;
+  simulateDelayMs?: number;
+  simulateSignal?: AbortSignal;
+}) {
   let requestCount = 0;
   let simulateCount = 0;
   const mock = {
@@ -55,6 +62,27 @@ function createMockServer(options?: { simulateResponse?: unknown; enforcedSimula
     async simulateTransaction() {
       requestCount++;
       simulateCount++;
+      if (options?.simulateDelayMs !== undefined) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, options.simulateDelayMs);
+          const signal = options.simulateSignal;
+          if (signal) {
+            if (signal.aborted) {
+              clearTimeout(timer);
+              reject(new Error("aborted"));
+              return;
+            }
+            signal.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                reject(new Error("aborted"));
+              },
+              { once: true },
+            );
+          }
+        });
+      }
       if (simulateCount === 2 && options?.enforcedSimulateResponse !== undefined) {
         return options.enforcedSimulateResponse;
       }
@@ -85,11 +113,64 @@ function createTestInterceptor(server: rpc.Server) {
   });
 }
 
+describe("PreFlightInterceptor transport config (server | url)", () => {
+  it("accepts a pre-built server instance and uses it verbatim", async () => {
+    const mockServer = createMockServer();
+    const interceptor = new PreFlightInterceptor({
+      server: mockServer,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+    });
+
+    const decision = await interceptor.check(validTransferCall());
+    assert.equal(decision.kind, "admissible");
+    assert.ok(mockServer.requestCount > 0, "calls must land on the injected server");
+  });
+
+  it("rejects a config supplying both server and url", () => {
+    assert.throws(
+      () =>
+        new PreFlightInterceptor({
+          server: createMockServer(),
+          url: "https://soroban-testnet.stellar.org",
+          networkPassphrase: "Test SDF Network ; September 2015",
+          guard: VALID_GUARD,
+          agent: Keypair.random(),
+          source: Keypair.random(),
+        } as unknown as ConstructorParameters<typeof PreFlightInterceptor>[0]),
+      (err: unknown) => {
+        assert(err instanceof InvalidInputError);
+        assert.equal(err.field, "server");
+        return true;
+      },
+    );
+  });
+
+  it("rejects a config supplying neither server nor url", () => {
+    assert.throws(
+      () =>
+        new PreFlightInterceptor({
+          networkPassphrase: "Test SDF Network ; September 2015",
+          guard: VALID_GUARD,
+          agent: Keypair.random(),
+          source: Keypair.random(),
+        } as unknown as ConstructorParameters<typeof PreFlightInterceptor>[0]),
+      (err: unknown) => {
+        assert(err instanceof InvalidInputError);
+        assert.equal(err.field, "server");
+        return true;
+      },
+    );
+  });
+});
+
 describe("validateContractCall validator unit tests", () => {
   describe("contract format validation", () => {
     it("rejects missing or empty contract string", () => {
       assert.throws(
-        () => validateContractCall({ contract: "", fn: "transfer", args: [] }),
+        () => validateContractCall({ contract: unsafeContractAddress(""), fn: "transfer", args: [] }),
         (err: unknown) => {
           assert(err instanceof InvalidInputError);
           assert.equal(err.field, "contract");
@@ -102,7 +183,7 @@ describe("validateContractCall validator unit tests", () => {
     it("rejects non-StrKey or malformed contract IDs", () => {
       for (const bad of ["invalid-contract", "GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH", "C1234"]) {
         assert.throws(
-          () => validateContractCall({ contract: bad, fn: "transfer", args: [] }),
+          () => validateContractCall({ contract: unsafeContractAddress(bad), fn: "transfer", args: [] }),
           (err: unknown) => {
             assert(err instanceof InvalidInputError);
             assert.equal(err.field, "contract");
@@ -283,7 +364,7 @@ describe("interceptor.check() input validation and zero RPC round-trips", () => 
     const interceptor = createTestInterceptor(mockServer);
 
     await assert.rejects(
-      async () => interceptor.check({ contract: "not-a-contract", fn: "transfer", args: [] }),
+      async () => interceptor.check({ contract: unsafeContractAddress("not-a-contract"), fn: "transfer", args: [] }),
       (err: unknown) => {
         assert(err instanceof InvalidInputError);
         assert.equal(err.field, "contract");
@@ -339,6 +420,75 @@ describe("interceptor.check() input validation and zero RPC round-trips", () => 
   });
 });
 
+describe("abortSignal + timeoutMs plumbing", () => {
+  it("already-aborted signal returns an undetermined verdict without any RPC call", async () => {
+    const mockServer = createMockServer();
+    const interceptor = createTestInterceptor(mockServer);
+    const controller = new AbortController();
+    controller.abort();
+
+    // A verdict question is answered with a verdict: the guard reached no
+    // decision, so the check fails closed on its `undetermined` arm instead of
+    // throwing at the caller.
+    const decision = await interceptor.check(validTransferCall(), { signal: controller.signal });
+
+    assert.equal(decision.kind, "undetermined");
+    const error = decision.error;
+    assert.ok(error instanceof RpcTimeoutError);
+    assert.equal(error.stage, "pre-flight");
+    assert.equal(error.aborted, true);
+    assert.equal(mockServer.requestCount, 0, "No RPC calls should be attempted when signal is already aborted");
+  });
+
+  it("mid-flight abort returns an undetermined verdict promptly", async () => {
+    const controller = new AbortController();
+    const mockServer = createMockServer({ simulateDelayMs: 10_000, simulateSignal: controller.signal });
+    const interceptor = createTestInterceptor(mockServer);
+
+    const started = Date.now();
+    const pending = interceptor.check(validTransferCall(), { signal: controller.signal });
+    setTimeout(() => controller.abort(), 10);
+    const decision = await pending;
+
+    assert.equal(decision.kind, "undetermined");
+    const error = decision.error;
+    assert.ok(error instanceof RpcTimeoutError);
+    assert.equal(error.aborted, true, "a caller abort is reported as an abort, not a timeout");
+    assert.ok(
+      Date.now() - started < 5_000,
+      "the verdict must arrive on the abort, not on the 10s simulation",
+    );
+  });
+
+  it("timeoutMs fires a typed RpcTimeoutError as an undetermined verdict", async () => {
+    const mockServer = createMockServer({ simulateDelayMs: 10_000 });
+    const interceptor = createTestInterceptor(mockServer);
+
+    const decision = await interceptor.check(validTransferCall(), { timeoutMs: 10 });
+
+    assert.equal(decision.kind, "undetermined");
+    const error = decision.error;
+    assert.ok(error instanceof RpcTimeoutError);
+    assert.equal(error.aborted, false);
+    assert.equal(error.timeoutMs, 10);
+    assert.equal(error.cause, "timeout");
+  });
+
+  it("a furnished signal that never fires leaves the verdict path untouched", async () => {
+    const controller = new AbortController();
+    const mockServer = createMockServer();
+    const interceptor = createTestInterceptor(mockServer);
+
+    const decision = await interceptor.check(validTransferCall(), {
+      signal: controller.signal,
+      timeoutMs: 30_000,
+    });
+
+    assert.equal(decision.kind, "admissible");
+    assert.ok(mockServer.requestCount > 0);
+  });
+});
+
 describe("boundary: valid-but-unusual inputs proceed to simulation", () => {
   it("allows unknown fn names to proceed to simulation (boundary: policy/contract question, not input shape)", async () => {
     const mockServer = createMockServer();
@@ -380,7 +530,7 @@ describe("throw vs verdict contract asymmetry", () => {
     const interceptor = createTestInterceptor(mockServer);
 
     await assert.rejects(
-      async () => interceptor.check({ contract: "", fn: "transfer", args: [] }),
+      async () => interceptor.check({ contract: unsafeContractAddress(""), fn: "transfer", args: [] }),
       InvalidInputError,
     );
   });
@@ -476,8 +626,8 @@ describe("throw vs verdict contract asymmetry", () => {
 /*             Unit tests for opt-in pre-flight simulation cache              */
 /* -------------------------------------------------------------------------- */
 
-const CONTRACT = "CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44";
-const OTHER_CONTRACT = Address.contract(Buffer.alloc(32)).toString();
+const CONTRACT = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
+const OTHER_CONTRACT = unsafeContractAddress(Address.contract(Buffer.alloc(32)).toString());
 const NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
 const CALL: ContractCall = { contract: CONTRACT, fn: "noop", args: [] };
 

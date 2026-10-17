@@ -1,3 +1,4 @@
+import { Account, Address, Keypair, Operation, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 /**
  * The full invocation pipeline for a guarded account, in the order the Stellar
  * host actually requires:
@@ -15,7 +16,6 @@
  * Steps 1–3 never mutate the ledger. A blocked action therefore costs nothing,
  * which is the property the pre-flight interceptor is built to expose.
  */
-import { Account, Address, Keypair, Operation, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import { feeBreakdown, type FeeBreakdown } from "./cost.ts";
 import {
   BroadcastError,
@@ -25,6 +25,12 @@ import {
   SimulationError,
 } from "./errors.ts";
 import { GUARD_AUTH_RESULTS, decodeAuthDecision } from "./events.ts";
+import {
+  SILENT_LOGGER,
+  resolveLogger,
+  type GuardLogger,
+  type GuardLoggerInput,
+} from "./logger.ts";
 import type { TraceStepName, TraceStepStatus } from "./trace.ts";
 import {
   SIG_EXPIRATION_LEDGERS,
@@ -33,6 +39,8 @@ import {
   buildInitialEnvelope,
   describeSimulationResources,
   describeSubmissionFailure,
+  INCLUSION_FEE,
+  isMinimumFeeBroadcastFailure,
   isSequenceNumberFailure,
   isStaleLedgerResourceFailure,
   parseSimulationResourceFee,
@@ -55,6 +63,131 @@ export interface GuardAuthorization {
    * `docs/concepts/multi-key-agent-signing.md`.
    */
   agent: AgentSigner | Keypair;
+}
+
+/**
+ * Default RPC timeout applied when a caller supplies neither `timeoutMs` nor
+ * its own `signal`. A hung Soroban RPC (network partition, black-holed
+ * connection) would otherwise leave `check()`/`invoke()` pending forever, which
+ * turns a fail-closed guardrail into an unbounded hang — not a decision. A
+ * bounded default is the safer posture: an agent that cannot reach the network
+ * gets a typed `RpcTimeoutError` and can fail closed on its own terms.
+ *
+ * 30s is generous enough for a slow-but-live RPC (a full enforced simulation
+ * against a busy ledger) while still bounding the worst case. Callers that
+ * need a different budget pass `timeoutMs` explicitly; callers that need no
+ * bound at all pass `timeoutMs: 0` (documented below).
+ */
+export const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+/**
+ * Raised when an RPC call is aborted or exceeds its timeout.
+ *
+ * The underlying HTTP request is *not* cancelled at the transport layer:
+ * `stellar-sdk` 17's `Server` methods do not accept an `AbortSignal`, so this
+ * SDK races the in-flight promise against the signal/timeout. The request
+ * therefore continues server-side until it completes or the connection times
+ * out; cancellation here is local-only. That is an honest limitation, not a
+ * bug — the caller's decision (fail closed) is what matters, and it is made
+ * promptly.
+ */
+export class RpcTimeoutError extends GuardError {
+  readonly kind = "timeout" as const;
+  /** Which pipeline stage was in flight when the bound fired. */
+  readonly stage: string;
+  /** True when the caller's own `AbortSignal` fired; false for a timeout. */
+  readonly aborted: boolean;
+  /** The budget that fired, in milliseconds; absent when the bound was a signal abort. */
+  readonly timeoutMs?: number | undefined;
+
+  constructor(params: { stage: string; aborted: boolean; timeoutMs?: number }) {
+    const reason = params.aborted
+      ? "aborted by caller signal"
+      : `exceeded timeout of ${params.timeoutMs}ms`;
+    // The classified cause the pipeline surfaces for an abort or a timeout:
+    // callers branch on `cause === "timeout"`. The `stage` and `aborted` fields
+    // carry the detail, so nothing is lost to the single coarse cause.
+    super(`RPC call during '${params.stage}' ${reason}`, { cause: "timeout" });
+    this.stage = params.stage;
+    this.aborted = params.aborted;
+    if (params.timeoutMs !== undefined) this.timeoutMs = params.timeoutMs;
+  }
+}
+
+/**
+ * Shared plumbing for every RPC call the pipeline makes.
+ *
+ * One implementation, used by `getAccount`, `getLatestLedger`,
+ * `simulateTransaction` (both probe and enforced), and `submitAndPoll` — so
+ * abort/timeout semantics cannot drift between stages. The rules:
+ *
+ *  - An already-aborted signal short-circuits *before* `run()` is invoked, so
+ *    no RPC call is made at all (the acceptance criterion: "already-aborted
+ *    signal returns without RPC call").
+ *  - A mid-flight abort or a fired timeout rejects promptly with
+ *    `RpcTimeoutError`, even though the underlying request keeps running.
+ *  - `timeoutMs: 0` disables the timeout entirely (opt-out for callers that
+ *    manage their own bound); `undefined` uses `DEFAULT_RPC_TIMEOUT_MS`.
+ *  - The signal/timeout listeners are always removed, so a long-lived signal
+ *    shared across many calls does not accumulate listeners.
+ */
+export async function withRpcAbort<T>(
+  params: {
+    stage: string;
+    signal?: AbortSignal | undefined;
+    timeoutMs?: number | undefined;
+  },
+  run: () => Promise<T>,
+): Promise<T> {
+  const { stage, signal } = params;
+  const timeoutMs = params.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+
+  if (signal?.aborted) {
+    throw new RpcTimeoutError({ stage, aborted: true });
+  }
+
+  if (timeoutMs <= 0 && !signal) return run();
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new RpcTimeoutError({ stage, aborted: true }));
+    };
+
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new RpcTimeoutError({ stage, aborted: false, timeoutMs }));
+      }, timeoutMs);
+    }
+
+    run().then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -82,12 +215,14 @@ export type InvokeErrorCause =
  */
 export type RetryableInvokeFailure =
   | "stale_ledger_resource_limit"
-  | "sequence_number_collision";
+  | "sequence_number_collision"
+  | "min_fee";
 
 /** The coarse cause each retryable failure reports once the budget is spent. */
 const RETRYABLE_CAUSES = {
   stale_ledger_resource_limit: INVOKE_ERROR_CAUSES.staleLedgerResourceLimit,
   sequence_number_collision: INVOKE_ERROR_CAUSES.sequenceNumberCollision,
+  min_fee: INVOKE_ERROR_CAUSES.undetermined,
 } as const satisfies Record<RetryableInvokeFailure, InvokeErrorCause>;
 
 /** The error arm returned by one invocation attempt. */
@@ -102,6 +237,10 @@ export interface InvokeErrorOutcome {
   cause?: InvokeErrorCause;
   /** Set when a re-simulation against fresh state can fix the failure. */
   retryable?: RetryableInvokeFailure;
+  /** Fee of the transaction when broadcast was attempted. */
+  lastFee?: bigint | undefined;
+  /** Submission result when broadcast was attempted. */
+  submission?: SubmissionResult | undefined;
 }
 
 /**
@@ -190,8 +329,26 @@ export interface InvokeDryRunResult {
   steps: InvokePipelineStep[];
 }
 
-export type InvokeOutcome =
-  | InvokeDryRunResult
+/** Configuration for bounded fee bumping when broadcast fails due to minimum fee. */
+export interface FeeBumpConfig {
+  /**
+   * Maximum total broadcast attempts permitted (initial attempt + retries).
+   * Default: 3 attempts.
+   */
+  maxAttempts?: number | undefined;
+  /**
+   * Multiplier applied to the inclusion fee on each fee-bump retry.
+   * Default: 2 (doubles the inclusion fee per attempt).
+   */
+  feeMultiplier?: number | undefined;
+  /**
+   * Initial inclusion fee in stroops to use on the first attempt.
+   * Default: 100 stroops (`INCLUSION_FEE`).
+   */
+  initialInclusionFee?: bigint | undefined;
+}
+
+export type PipelineOutcome =
   | { kind: "allowed"; submission: SubmissionResult }
   | {
       kind: "blocked";
@@ -207,6 +364,11 @@ export type InvokeOutcome =
     }
   | InvokeErrorOutcome
   | InvokeRetryError;
+
+export type InvokeOutcome =
+  | InvokeDryRunResult
+  | PipelineOutcome
+  | BroadcastError;
 
 /** Defaults for the bounded stale-ledger retry policy. */
 export const DEFAULT_INVOKE_RETRY_OPTIONS = {
@@ -258,15 +420,57 @@ export interface InvokeParams {
   retry?: InvokeRetryOptions | undefined;
   pollAttempts?: number | undefined;
   pollIntervalMs?: number | undefined;
+  /** Options controlling polling interval and attempts after submission. */
+  pollOptions?: { pollAttempts?: number; pollIntervalMs?: number } | undefined;
+  /**
+   * Optional configuration for fee-bump retry when broadcast hits min-fee.
+   * If omitted, defaults to 3 attempts with a 2x fee multiplier.
+   */
+  feeBump?: FeeBumpConfig | undefined;
+  /**
+   * Overall maximum retries across retryable classes. If specified, bounds the
+   * total attempts across all triggers.
+   */
+  maxRetries?: number | undefined;
+  /** Custom inclusion fee (used internally during fee-bump retries). */
+  fee?: bigint | string | undefined;
+  /**
+   * Caller-owned cancellation. When aborted, the pipeline stops at the next
+   * RPC boundary and `invoke()` returns its `error` outcome carrying an
+   * `RpcTimeoutError` (see `RpcTimeoutError` for the local-only cancellation
+   * caveat). An already-aborted signal short-circuits before any RPC call.
+   */
+  signal?: AbortSignal | undefined;
+  /**
+   * Bound on each individual RPC call, in milliseconds. Defaults to
+   * `DEFAULT_RPC_TIMEOUT_MS` (30s); pass `0` to disable the timeout and rely
+   * solely on `signal`. A fired timeout produces the same `RpcTimeoutError`
+   * outcome as an abort.
+   */
+  timeoutMs?: number | undefined;
   /**
    * Optional, logger-agnostic observability hook: one `InvokeStepEvent` per
    * pipeline-stage attempt, covering probe → sign → simulate → broadcast,
    * including every attempt of the built-in stale-ledger retry. Omitting it
-   * leaves `invoke()` exactly as it was before this hook existed — the SDK
-   * itself never logs and takes no logger dependency; what a consumer does
-   * with the events is entirely the consumer's business.
+   * leaves `invoke()` exactly as it was before this hook existed; what a
+   * consumer does with the events is entirely the consumer's business.
    */
   onStep?: ((step: InvokeStepEvent) => void) | undefined;
+  /**
+   * Optional log sink. Omitted — the default — `invoke()` writes nothing
+   * anywhere: no console output, no stdout or stderr, no implicit
+   * process-level logger.
+   *
+   * Supplying one reports the same decision points `onStep` exposes (each stage
+   * attempt), plus the retry loop's attempts and the terminal outcome, at
+   * levels a host can filter: stage attempts and retries at `debug`, a guard
+   * refusal at `info`, anything that ended without a verdict at `warn`.
+   *
+   * A logger never changes behaviour — outcomes, retry counts and timings are
+   * identical with and without one — and a logger that throws is isolated, so
+   * a broken sink cannot decide whether a transaction runs.
+   */
+  logger?: GuardLoggerInput | undefined;
 }
 
 /**
@@ -293,10 +497,9 @@ export interface InvokeStepEvent {
 /**
  * Emit one step event to the caller's `onStep` callback.
  *
- * The callback is the caller's, and this SDK stays logger-agnostic — there is
- * deliberately no logger dependency to fall back on — so a throwing callback
- * is swallowed and the pipeline carries on: observability must never decide
- * whether a transaction runs. Two cases matter. A callback throw on the happy
+ * The callback is the caller's, and it is not routed anywhere: a `logger` is a
+ * separate sink, so a throwing callback is swallowed and the pipeline carries
+ * on: observability must never decide whether a transaction runs. Two cases matter. A callback throw on the happy
  * path must not turn a successful stage into a failed one. And when the stage
  * itself failed, the original error must survive untouched: swallowing here
  * means the callback's error simply vanishes, and `invoke()` rethrows the real
@@ -310,8 +513,38 @@ function emitStep(
   try {
     hook(event);
   } catch {
-    /* logger-agnostic policy: a broken consumer must not break the pipeline */
+    /* a broken consumer must not break the pipeline */
   }
+}
+
+/**
+ * The stage hook the pipeline actually uses: the caller's `onStep` and, when a
+ * logger was injected, a `debug` line for the same event.
+ *
+ * Returns `undefined` when neither sink is supplied, which is what keeps the
+ * default path free of timing work: `withStepTiming` runs the stage directly
+ * on `undefined`, adding no timers and emitting nothing. The two sinks are
+ * independent — a host may supply either, both, or neither — and a logger is
+ * compared against `SILENT_LOGGER` by identity so a caller that passed no
+ * logger is not taxed for a sink that writes nothing.
+ */
+function stepHook(
+  hook: ((step: InvokeStepEvent) => void) | undefined,
+  logger: GuardLogger,
+): ((step: InvokeStepEvent) => void) | undefined {
+  const logs = logger !== SILENT_LOGGER;
+  if (!hook && !logs) return undefined;
+  return (step: InvokeStepEvent): void => {
+    emitStep(hook, step);
+    if (logs) {
+      logger.debug(`pipeline step ${step.name} ${step.status}`, {
+        step: step.name,
+        status: step.status,
+        durationMs: step.durationMs,
+        attempt: step.attempt,
+      });
+    }
+  };
 }
 
 /**
@@ -674,25 +907,122 @@ export async function invoke(params: InvokeParams): Promise<InvokeOutcome> {
   // serialize against the account queue.
   if (params.dryRun) return invokeDryRun(params);
 
+  try {
+    // Every RPC the pipeline makes sits inside this bound: an already-aborted
+    // signal short-circuits before the account is looked up, and a mid-flight
+    // abort or a fired timeout rejects promptly with `RpcTimeoutError`.
+    return await withRpcAbort(
+      { stage: "invoke", signal: params.signal, timeoutMs: params.timeoutMs },
+      () => invokeWithQueue(params),
+    );
+  } catch (error) {
+    if (error instanceof RpcTimeoutError) {
+      // A bound that fired is a fail-closed *decision*, not a crash: the guard
+      // never reached a verdict, which is exactly the `error` arm's meaning.
+      return timeoutOutcome(error);
+    }
+    throw error;
+  }
+}
+
+async function invokeWithQueue(params: InvokeParams): Promise<InvokeOutcome> {
   const sourceKey = await params.source.publicKey();
   return withAccountQueue(params.server, sourceKey, async () => {
     const retry = resolveRetryOptions(params.retry);
-    let attempts = 0;
+    const logger = resolveLogger(params.logger);
+
+    const configuredFeeMax =
+      params.feeBump?.maxAttempts ??
+      (params.maxRetries !== undefined ? params.maxRetries + 1 : 3);
+    const maxFeeAttempts = Math.max(1, configuredFeeMax);
+    const feeMultiplier = params.feeBump?.feeMultiplier ?? 2;
+    let currentInclusionFee = params.feeBump?.initialInclusionFee ?? BigInt(INCLUSION_FEE);
+
+    let feeAttempt = 0;
+    let generalAttempt = 0;
 
     while (true) {
-      attempts += 1;
+      generalAttempt += 1;
+      feeAttempt += 1;
       // `attempt` is the 0-based index `onStep` reports; `attempts` is the count.
-      const outcome = await invokePipeline(params, attempts - 1);
+      const outcome = await invokePipeline(params, generalAttempt - 1, {
+        inclusionFee: currentInclusionFee,
+      });
 
       if (outcome.kind !== "error" || outcome.retryable === undefined) {
+        logTerminalOutcome(logger, outcome);
         return outcome;
       }
-      if (attempts >= retry.maxAttempts) {
-        return new InvokeRetryError({ attempts, lastOutcome: outcome });
+
+      if (outcome.retryable === "min_fee") {
+        if (feeAttempt < maxFeeAttempts) {
+          const bumped = BigInt(Math.ceil(Number(currentInclusionFee) * feeMultiplier));
+          currentInclusionFee = bumped > currentInclusionFee ? bumped : currentInclusionFee + 100n;
+          continue;
+        }
+
+        const broadcastError = new BroadcastError({
+          attempts: feeAttempt,
+          lastFee: outcome.lastFee ?? currentInclusionFee,
+          failure: outcome.submission?.failure ?? {
+            resultXdr: null,
+            resultCode: "result=txInsufficientFee",
+            message: outcome.detail,
+            diagnosticEvents: [],
+          },
+          detail: outcome.detail,
+        });
+        return broadcastError;
       }
 
-      await retry.sleep(fullJitterDelay(attempts, retry));
+      if (generalAttempt >= retry.maxAttempts) {
+        logger.warn(`invoke retry budget exhausted after ${generalAttempt} attempt(s)`, {
+          attempts: generalAttempt,
+          maxAttempts: retry.maxAttempts,
+          retryable: outcome.retryable,
+        });
+        return new InvokeRetryError({ attempts: generalAttempt, lastOutcome: outcome });
+      }
+
+      logger.debug(
+        `retrying invoke after a retryable failure (attempt ${generalAttempt} of ${retry.maxAttempts})`,
+        { attempt: generalAttempt, maxAttempts: retry.maxAttempts, retryable: outcome.retryable },
+      );
+      await retry.sleep(fullJitterDelay(generalAttempt, retry));
     }
+  });
+}
+
+/**
+ * Report a terminal pipeline outcome at the level its severity deserves.
+ *
+ * Terminal means "this is the answer the caller is about to receive". A failure
+ * the retry loop is still going to retry is announced by the loop's own retry
+ * line instead, so one failure is never reported twice and a retry that
+ * eventually succeeds does not leave a warning behind.
+ */
+function logTerminalOutcome(logger: GuardLogger, outcome: InvokeOutcome): void {
+  // Unreachable from `invoke()` — a dry run returns before the retry loop — but
+  // the outcome union is shared, and a dry run is not a submission to report.
+  if (outcome.kind === "dry_run") return;
+  if (outcome.kind === "blocked") {
+    logger.info(`guard refused the call (${outcome.reason ?? "unstated"})`, {
+      reason: outcome.reason,
+      // A post-broadcast refusal was charged; a pre-broadcast one was free, and
+      // that distinction is the whole point of the pipeline order.
+      charged: outcome.charged === true,
+      transactionHash: outcome.transactionHash ?? null,
+    });
+    return;
+  }
+  if (outcome.kind === "error") {
+    logger.warn(`invoke ended without a verdict: ${outcome.detail}`, {
+      cause: outcome.cause ?? null,
+    });
+    return;
+  }
+  logger.debug("call admitted and submitted", {
+    transactionHash: outcome.submission?.hash ?? null,
   });
 }
 
@@ -826,9 +1156,20 @@ export type EnforcementOutcome =
     };
 
 /** One attempt: simulate → sign → enforce → submit. No retry logic lives here. */
-async function invokePipeline(params: InvokeParams, attempt: number): Promise<InvokeOutcome> {
+async function invokePipeline(
+  params: InvokeParams,
+  attempt: number,
+  options?: { inclusionFee?: bigint | undefined },
+): Promise<PipelineOutcome> {
   const { server } = params;
-  const enforced = await enforceCall(params, attempt);
+  const onStep = stepHook(params.onStep, resolveLogger(params.logger));
+  const enforced = await enforceCall(
+    {
+      ...params,
+      ...(options?.inclusionFee !== undefined ? { fee: options.inclusionFee } : {}),
+    },
+    attempt,
+  );
   if (enforced.kind === "error") {
     // The guard never made a decision, so this is `undetermined` and not
     // `blocked`. Classify it here, at the point the failure is produced, so
@@ -853,6 +1194,7 @@ async function invokePipeline(params: InvokeParams, attempt: number): Promise<In
       operation: enforced.operation,
       networkPassphrase: params.networkPassphrase,
       guard: params.guardAuth?.guard ?? null,
+      ...(options?.inclusionFee !== undefined ? { inclusionFee: options.inclusionFee } : {}),
     });
   } catch (cause) {
     // The enforced simulation passed, so a failure to turn its result into a
@@ -870,14 +1212,21 @@ async function invokePipeline(params: InvokeParams, attempt: number): Promise<In
   }
 
   let submission: SubmissionResult;
+  const pollAttempts = params.pollOptions?.pollAttempts ?? params.pollAttempts;
+  const pollIntervalMs = params.pollOptions?.pollIntervalMs ?? params.pollIntervalMs;
+  const signers: Array<Keypair | AdminSigner> = [
+    params.source,
+    ...(params.accountSigners ?? []),
+  ];
+
   try {
     submission = await withStepTiming(
-      params.onStep,
+      onStep,
       { name: "broadcast", attempt },
       () =>
-        submitAndPoll(server, assembled.transaction, [params.source], {
-          pollAttempts: params.pollAttempts,
-          pollIntervalMs: params.pollIntervalMs,
+        submitAndPoll(server, assembled.transaction, signers, {
+          pollAttempts,
+          pollIntervalMs,
         }),
       (result) => result.failure !== null,
     );
@@ -913,11 +1262,12 @@ async function invokePipeline(params: InvokeParams, attempt: number): Promise<In
         charged: true,
       };
     }
-    const staleLedger = isStaleLedgerResourceFailure(submission.failure);
+    const isMinFee = isMinimumFeeBroadcastFailure(submission.failure);
+    const staleLedger = !isMinFee && isStaleLedgerResourceFailure(submission.failure);
     // A sequence collision is only expected when something outside this queue
     // broadcasts for the same account; inside the queue it means the RPC
     // snapshot lagged further than the per-account reservation assumed.
-    const sequenceCollision = !staleLedger && isSequenceNumberFailure(submission.failure);
+    const sequenceCollision = !isMinFee && !staleLedger && isSequenceNumberFailure(submission.failure);
     return {
       kind: "error",
       detail,
@@ -932,7 +1282,11 @@ async function invokePipeline(params: InvokeParams, attempt: number): Promise<In
         ? { retryable: "stale_ledger_resource_limit" as const }
         : sequenceCollision
           ? { retryable: "sequence_number_collision" as const }
-          : {}),
+          : isMinFee
+            ? { retryable: "min_fee" as const }
+            : {}),
+      lastFee: BigInt(assembled.transaction.fee),
+      submission,
     };
   }
   return { kind: "allowed", submission };
@@ -950,6 +1304,8 @@ export async function enforceCall(
   attempt: number = 0,
 ): Promise<EnforcementOutcome> {
   const { server, source, call, networkPassphrase } = params;
+  const logger = resolveLogger(params.logger);
+  const onStep = stepHook(params.onStep, logger);
 
   let operation: xdr.Operation;
   let expiration: number;
@@ -984,9 +1340,10 @@ export async function enforceCall(
       operation,
       networkPassphrase,
       guard: params.guardAuth?.guard ?? null,
+      fee: params.fee,
     });
     first = await withStepTiming(
-      params.onStep,
+      onStep,
       { name: "probe", attempt },
       () => server.simulateTransaction(probe),
       (response) => rpc.Api.isSimulationError(response),
@@ -1161,7 +1518,7 @@ export async function enforceCall(
 
   let signedAuth: xdr.SorobanAuthorizationEntry[];
   try {
-    signedAuth = await withStepTiming(params.onStep, { name: "sign", attempt }, signRequiredAuth);
+    signedAuth = await withStepTiming(onStep, { name: "sign", attempt }, signRequiredAuth);
   } catch (error) {
     // A signing-stage shape refusal is a result, not an exception: keep
     // reporting it exactly as the pipeline always has, word for word, with the
@@ -1186,7 +1543,7 @@ export async function enforceCall(
   let enforced: rpc.Api.SimulateTransactionResponse;
   try {
     const simulated = await withStepTiming(
-      params.onStep,
+      onStep,
       { name: "simulate", attempt },
       async () => {
         const authorized = Operation.invokeContractFunction({
@@ -1200,6 +1557,7 @@ export async function enforceCall(
           operation: authorized,
           networkPassphrase,
           guard: params.guardAuth?.guard ?? null,
+          fee: params.fee,
         });
         return { operation: authorized, response: await server.simulateTransaction(enforcingTx) };
       },
@@ -1220,8 +1578,29 @@ export async function enforceCall(
       diagnosticEvents: [],
     };
   }
-  if (process.env["SAG_DEBUG_RESOURCES"] === "1") {
-    console.log(`[debug] enforced simulation:\n${describeSimulationResources(enforced, params.guardAuth?.guard ?? null)}`);
+  // This used to be an env-gated write straight to the host's stdout
+  // (`SAG_DEBUG_RESOURCES=1`). The description is the same; it now reaches an
+  // injected logger and otherwise goes nowhere, because a library does not get
+  // to decide where an application's output goes. The README's logging section
+  // shows the one-liner that deliberately restores the old behaviour.
+  //
+  // Two guards around it. The description is only rendered when a logger is
+  // attached, so the default path pays nothing for output nobody will read — and
+  // it is isolated, because rendering parses the simulation's XDR and a
+  // description that cannot be produced is not a reason to fail a call whose
+  // simulation just succeeded.
+  if (logger !== SILENT_LOGGER) {
+    try {
+      logger.debug(describeSimulationResources(enforced, params.guardAuth?.guard ?? null), {
+        guard: params.guardAuth?.guard ?? null,
+        stage: "simulate",
+      });
+    } catch {
+      logger.debug("enforced simulation succeeded (resource description unavailable)", {
+        guard: params.guardAuth?.guard ?? null,
+        stage: "simulate",
+      });
+    }
   }
   if (rpc.Api.isSimulationError(enforced)) {
     // NOTE: a simulation failure here is not automatically a block — see the
@@ -1262,5 +1641,30 @@ export async function enforceCall(
     simulation: enforced as rpc.Api.SimulateTransactionSuccessResponse,
     operation: signedOperation,
     nextSeq,
+  };
+}
+
+/**
+ * Convert a fired cancel/timeout into the pipeline's `error`/`undetermined` arm
+ * rather than letting it escape as an exception.
+ *
+ * The asymmetry with `invoke()` is deliberate and documented in the README:
+ * `check()`/`cost()` answer a *verdict* question, so a timeout is reported as
+ * `undetermined` carrying the typed `RpcTimeoutError` — the guard made no
+ * decision, and the caller's fail-closed policy takes over. `invoke()` drives a
+ * *pipeline* that was already committed to broadcasting, so a timeout there
+ * surfaces through `invoke()`'s own `error` outcome, which the caller must
+ * handle explicitly. Either way the error class is the same one — callers
+ * branch on `instanceof RpcTimeoutError`, never on a message.
+ *
+ * The `RpcTimeoutError` is carried as-is (not re-wrapped) so `instanceof`,
+ * `stage` and `aborted` survive the trip to the caller.
+ */
+export function timeoutOutcome(error: RpcTimeoutError): InvokeErrorOutcome {
+  return {
+    kind: "error",
+    detail: error.message,
+    error,
+    diagnosticEvents: [],
   };
 }

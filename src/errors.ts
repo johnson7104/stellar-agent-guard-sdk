@@ -1,4 +1,4 @@
-/**
+/*
  * Structured SDK failures.
  *
  * Callers should branch on an error class (or on the class attached to a result-
@@ -50,17 +50,63 @@ export class SigningError extends GuardError {
   }
 }
 
+export interface BroadcastFailurePayload {
+  resultXdr: string | null;
+  resultCode: string | null;
+  message: string;
+  diagnosticEvents: unknown[];
+}
+
+export interface BroadcastFailureParams {
+  attempts: number;
+  lastFee: bigint;
+  failure: BroadcastFailurePaayload;
+  detail?: string | undefined;
+}
+
 /** Submission failed after assembly, or the RPC rejected the send request. */
 export class BroadcastError extends GuardError {
+  readonly kind = "error" as const;
   /** Present once the RPC has assigned a hash; absent for pre-send failures. */
   readonly transactionHash: string | null;
+  readonly attempts?: number | undefined;
+  readonly lastFee?: bigint | undefined;
+  readonly failure?: BroadcastFailurePayload | undefined;
+  readonly detail?: string | undefined;
 
   constructor(
     message: string,
+    options?: { transactionHash?: string | null; cause?: unknown },
+  );
+  constructor(params: BroadcastFailureParams);
+  constructor(
+    messageOrParams: string | BroadcastFailureParams,
     options: { transactionHash?: string | null; cause?: unknown } = {},
   ) {
-    super(message, causeOptions(options.cause));
-    this.transactionHash = options.transactionHash ?? null;
+    if (typeof messageOrParams === "string") {
+      super(messageOrParams, causeOptions(options.cause));
+      this.name = "BroadcastError";
+      this.transactionHash = options.transactionHash ?? null;
+      this.attempts = undefined;
+      this.lastFee = undefined;
+      this.failure = undefined;
+      this.detail = undefined;
+    } else {
+      const detail = messageOrParams.detail ?? messageOrParams.failure.message;
+      super(
+        `stellar-agent-guard broadcast failed: minimum fee not met after ${messageOrParams.attempts} attempt(s) (last fee: ${messageOrParams.lastFee} stroops)\n${detail}`,
+      );
+      this.name = "BroadcastError";
+      this.transactionHash = null;
+      this.attempts = messageOrParams.attempts;
+      this.lastFee = messageOrParams.lastFee;
+      this.failure = messageOrParams.failure;
+      this.detail = detail;
+    }
+  }
+
+  get error(): BroadcastError {
+    return this;
   }
 }
 
@@ -82,5 +128,55 @@ export class PolicyDecodeError extends GuardError {
   constructor(message: string, options: { path: string; cause?: unknown }) {
     super(message, causeOptions(options.cause));
     this.path = options.path;
+  }
+}
+
+/**
+ * An adapter was constructed with misconfigured options.
+ *
+ * This is a programmer error, not a policy refusal: it is thrown at
+ * construction time, before the adapter ever sees an agent action, so a code
+ * bug in the integration fails fast instead of killing the first tool call of
+ * production. The `field` names the offending option and `expected` describes the
+ * shape it must have, so the fix is obvious without reading this SDK's
+ * source.
+ */
+export class AdapterConfigError extends GuardError {
+  /** Option key that was missing or had the wrong type. */
+  readonly field: string;
+  /** Human-readable description of the expected shape. */
+  readonly expected: string;
+  /** Adapter identifier, e.g. `"langchain"` or `"elizaos"`. */
+  readonly adapter: string;
+
+  constructor(
+    message: string,
+    options: { field: string; expected: string; adapter: string; cause?: unknown },
+  ) {
+    super(message, causeOptions(options.cause));
+    this.field = options.field;
+    this.expected = options.expected;
+    this.adapter = options.adapter;
+  }
+}
+
+/**
+ * The RPC transport configuration passed to a surface is invalid.
+ *
+ * Thrown at construction time when a caller supplies both `server` and
+ * `url` (ambiguous) or neither (unconfigured). The injected `server` is used
+ * verbatim when provided, so proxy/auth/mTLS setup can happen before this SDK
+ * sees the client.
+ */
+export class RpcConfigError extends GuardError {
+  /** Which configuration rule was violated. */
+  readonly reason: "both-provided" | "neither-provided";
+
+  constructor(
+    message: string,
+    options: { reason: RpcConfigError["reason"]; cause?: unknown },
+  ) {
+    super(message, causeOptions(options.cause));
+    this.reason = options.reason;
   }
 }
