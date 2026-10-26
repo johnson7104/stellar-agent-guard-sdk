@@ -2,8 +2,6 @@ node_modules/
 dist/
 build/
 *.log
-.env
-.env.*
 # Templates are the exception: they carry key *names* only, never values. The
 # glob (not just !.env.example) is deliberate so a future .env.phase3.example is
 # committable without a follow-up gitignore edit — the live suite's requirement
@@ -12,3 +10,4 @@ build/
 .DS_Store
 *.tsbuildinfo
 coverage/
+config.bat

@@ -3421,6 +3421,22 @@ export function parseEventRecord(line: string): ParsedGuardEventRecord {
   return { version, event: event as Record<string, unknown> };
 }
 
+/** Hard upper bound the Stellar RPC enforces on one `getEvents` page. */
+export const RPC_MAX_EVENTS_PER_CALL = 10_000;
+
+/** The page size the RPC itself applies when a request omits `limit`. */
+export const DEFAULT_TELEMETRY_PAGE_SIZE = 100;
+
+/** Listener-level, presentation-only event filter. */
+export interface GuardEventFilter {
+  /** Keep events emitted by any of these contract addresses. */
+  contractIds?: readonly string[] | undefined;
+  /** Keep events whose decoded decision reason is one of these. */
+  reasons?: readonly string[] | undefined;
+  /** Keep events observed on any of these streams. */
+  streams?: readonly GuardEventStream[] | undefined;
+}
+
 /** A compact one-line rendering of a guard event, for logs. */
 export function describeGuardEvent(event: GuardEvent): string {
   const where =

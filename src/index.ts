@@ -25,6 +25,7 @@ export {
   AdapterMappingError,
   BroadcastError,
   ContractResponseError,
+  FeeCapExceededError,
   GuardError,
   GuardUndeterminedError,
   InvalidFeeCeilingError,
@@ -126,6 +127,14 @@ export {
   policyToJson,
 } from "./policy-json.ts";
 
+export { DEFAULT_TELEMETRY_PAGE_SIZE, RPC_MAX_EVENTS_PER_CALL } from "./telemetry.ts";
+export type { GuardEventFilter } from "./telemetry.ts";
+export type {
+  PolicyValidationResult,
+  ContractPolicyRuleId,
+  CONTRACT_POLICY_RULE_IDS,
+  POLICY_RULE_MESSAGES,
+} from "./policy-preflight.ts";
 export type {
   PolicyJson,
   PolicyJsonProtocolRule,

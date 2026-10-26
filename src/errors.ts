@@ -240,6 +240,49 @@ export class BroadcastError extends GuardError {
   }
 }
 
+/** A caller's `maxFeeCap` would be exceeded by the transaction `invoke()` is
+ * about to broadcast.
+ *
+ * Raised as a fail-closed `error` outcome **before** `sendTransaction`, never as
+ * a guard refusal: the guard approved the call and the network priced it, the
+ * caller's own spend ceiling is what stopped it. The breakdown is carried as
+ * exact stroop `bigint`s so an operator can see *which* half grew — a resource
+ * fee spike versus a fee-bump retry's inclusion fee — without parsing text.
+ */
+export class FeeCapExceededError extends GuardError {
+  /** Stable code for consumers that branch on the failure. */
+  readonly code = "fee_cap_exceeded" as const;
+  /** The ceiling supplied as `maxFeeCap`. */
+  readonly maxFeeCap: bigint;
+  /** Simulated resource fee, in stroops. */
+  readonly resourceFeeStroops: bigint;
+  /** Inclusion fee the attempt would have declared, in stroops. */
+  readonly inclusionFeeStroops: bigint;
+  /** `resourceFeeStroops + inclusionFeeStroops`, in stroops. */
+  readonly totalFeeStroops: bigint;
+  /** 0-based pipeline attempt whose price breached the cap. */
+  readonly attempt: number;
+
+  constructor(params: {
+    maxFeeCap: bigint;
+    resourceFeeStroops: bigint;
+    inclusionFeeStroops: bigint;
+    attempt: number;
+  }) {
+    const totalFeeStroops = params.resourceFeeStroops + params.inclusionFeeStroops;
+    super(
+      `fee cap exceeded: total ${totalFeeStroops} stroops ` +
+        `(resource ${params.resourceFeeStroops} + inclusion ${params.inclusionFeeStroops}) ` +
+        `exceeds maxFeeCap ${params.maxFeeCap} stroops; nothing was broadcast`,
+    );
+    this.maxFeeCap = params.maxFeeCap;
+    this.resourceFeeStroops = params.resourceFeeStroops;
+    this.inclusionFeeStroops = params.inclusionFeeStroops;
+    this.totalFeeStroops = totalFeeStroops;
+    this.attempt = params.attempt;
+  }
+}
+
 /** A contract response did not match the API shape the SDK understands. */
 export class ContractResponseError extends GuardError {
   /** The exact field of the contract response that did not match. */
